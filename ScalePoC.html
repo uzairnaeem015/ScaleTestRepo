@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Scale Serial Tester</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, Arial; margin:18px; max-width:980px; }
+    label { display:block; margin-top:10px; font-weight:600; }
+    input, select, textarea, button { font-size:14px; padding:8px; margin-top:6px; }
+    .row { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+    .col { flex:1 1 200px; min-width:160px; }
+    #rawLog { width:100%; height:220px; margin-top:8px; white-space:pre-wrap; background:#0b0b0b; color:#b7f2b7; padding:10px; overflow:auto; font-family: monospace; }
+    #parsed { margin-top:10px; padding:10px; background:#f3f3f3; border-radius:6px; }
+    .small { font-size:12px; color:#666; }
+    .controls { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }
+    .status { margin-top:8px; font-weight:600; color:#333; }
+  </style>
+</head>
+<body>
+  <h3>Scale Serial Tester</h3>
+
+  <div>
+    <label>Serial Settings</label>
+    <div class="row">
+      <div class="col">
+        <label class="small">Baud Rate</label>
+        <input id="baud" type="number" value="9600" />
+      </div>
+      <div class="col">
+        <label class="small">Data Bits</label>
+        <select id="dataBits"><option>8</option><option>7</option></select>
+      </div>
+      <div class="col">
+        <label class="small">Parity</label>
+        <select id="parity"><option value="none">None</option><option value="even">Even</option><option value="odd">Odd</option></select>
+      </div>
+      <div class="col">
+        <label class="small">Stop Bits</label>
+        <select id="stopBits"><option value="1">1</option><option value="2">2</option></select>
+      </div>
+      <div class="col">
+        <label class="small">Line Delimiter</label>
+        <select id="delimiter"><option value="CRLF">CRLF (\r\n)</option><option value="LF">LF (\n)</option><option value="CR">CR (\r)</option></select>
+      </div>
+    </div>
+
+    <div class="controls">
+      <button id="btnChoose">Choose Port and Connect</button>
+      <button id="btnUseGranted">Use Previously Granted Port</button>
+      <button id="btnDisconnect" disabled>Disconnect</button>
+      <button id="btnListPorts">List OS-visible Ports</button>
+      <button id="btnClearLog">Clear Log</button>
+    </div>
+  </div>
+
+  <label>Request Command to Poll Scale</label>
+  <input id="requestCmd" type="text" value="S\r\n" />
+  <div class="small">Use \r and \n for CR and LF. Leave empty if scale streams continuously.</div>
+
+  <div class="controls">
+    <button id="btnSend" disabled>Send Request</button>
+    <button id="btnAutoPoll" disabled>Start Auto Poll (1s)</button>
+    <button id="btnStopAuto" disabled>Stop Auto Poll</button>
+  </div>
+
+  <label>Raw Serial Log</label>
+  <div id="rawLog"></div>
+
+  <label>Parsed Weight</label>
+  <div id="parsed">
+    <div><strong>Value</strong>: <span id="val">—</span></div>
+    <div><strong>Unit</strong>: <span id="unit">—</span></div>
+    <div><strong>Status</strong>: <span id="status">—</span></div>
+  </div>
+
+  <div class="status" id="diagnostic">Status: idle</div>
+
+<script>
+/* Single-file Web Serial tester
+   Requirements: Chromium browser, page served from http://localhost or https://
+*/
+
+const btnChoose = document.getElementById('btnChoose');
+const btnUseGranted = document.getElementById('btnUseGranted');
+const btnDisconnect = document.getElementById('btnDisconnect');
+const btnSend = document.getElementById('btnSend');
+const btnAutoPoll = document.getElementById('btnAutoPoll');
+const btnStopAuto = document.getElementById('btnStopAuto');
+const btnListPorts = document.getElementById('btnListPorts');
+const btnClearLog = document.getElementById('btnClearLog');
+const rawLog = document.getElementById('rawLog');
+const valEl = document.getElementById('val');
+const unitEl = document.getElementById('unit');
+const statusEl = document.getElementById('status');
+const diag = document.getElementById('diagnostic');
+
+let port = null;
+let reader = null;
+let writer = null;
+let keepReading = false;
+let pollInterval = null;
+
+// Adjust this regex to match your scale's ASCII output exactly
+const weightRegex = /([+-]?\d{1,7}(?:\.\d+)?)[\s]*([kKgGlLbB]{1,2})?/;
+
+function appendLog(msg) {
+  const ts = new Date().toLocaleTimeString();
+  rawLog.textContent += `[${ts}] ${msg}\n`;
+  rawLog.scrollTop = rawLog.scrollHeight;
+}
+
+function setDiag(msg) {
+  diag.textContent = 'Status: ' + msg;
+}
+
+function decodeEscapes(s) {
+  return s.replace(/\\r/g, '\r').replace(/\\n/g, '\n').replace(/\\t/g, '\t');
+}
+
+function getDelimiter() {
+  const v = document.getElementById('delimiter').value;
+  if (v === 'CRLF') return '\r\n';
+  if (v === 'LF') return '\n';
+  return '\r';
+}
+
+async function setupPort(chosenPort) {
+  const baudRate = Number(document.getElementById('baud').value) || 9600;
+  const dataBits = Number(document.getElementById('dataBits').value) || 8;
+  const parity = document.getElementById('parity').value || 'none';
+  const stopBits = Number(document.getElementById('stopBits').value) || 1;
+
+  await chosenPort.open({ baudRate, dataBits, parity, stopBits });
+  appendLog(`Port opened: ${baudRate} ${dataBits}/${parity}/${stopBits}`);
+  setDiag('connected');
+
+  // Writer: TextEncoderStream -> port.writable
+  const textEncoder = new TextEncoderStream();
+  textEncoder.readable.pipeTo(chosenPort.writable);
+  writer = textEncoder.writable.getWriter();
+
+  // Reader: port.readable -> TextDecoderStream
+  const textDecoder = new TextDecoderStream();
+  chosenPort.readable.pipeTo(textDecoder.writable);
+  reader = textDecoder.readable.getReader();
+
+  port = chosenPort;
+  keepReading = true;
+  readLoop();
+
+  btnChoose.disabled = true;
+  btnUseGranted.disabled = true;
+  btnDisconnect.disabled = false;
+  btnSend.disabled = false;
+  btnAutoPoll.disabled = false;
+  btnStopAuto.disabled = true;
+}
+
+async function connectWithPicker() {
+  if (!('serial' in navigator)) {
+    appendLog('Web Serial API not supported in this browser.');
+    setDiag('Web Serial not supported');
+    return;
+  }
+  try {
+    // Optionally add filters: [{ usbVendorId: 0x0403, usbProductId: 0x6001 }]
+    const chosen = await navigator.serial.requestPort();
+    if (!chosen) { appendLog('No port selected.'); setDiag('no port selected'); return; }
+    await setupPort(chosen);
+  } catch (err) {
+    handleSerialError(err);
+  }
+}
+
+async function usePreviouslyGranted() {
+  if (!('serial' in navigator)) {
+    appendLog('Web Serial API not supported in this browser.');
+    setDiag('Web Serial not supported');
+    return;
+  }
+  try {
+    const ports = await navigator.serial.getPorts();
+    if (ports.length === 0) { appendLog('No previously granted ports found. Use Choose Port.'); setDiag('no granted ports'); return; }
+    await setupPort(ports[0]);
+  } catch (err) {
+    handleSerialError(err);
+  }
+}
+
+function handleSerialError(err) {
+  if (!err) { appendLog('Unknown error'); setDiag('error'); return; }
+  if (err.name === 'NotFoundError' || err.name === 'AbortError') {
+    appendLog('No port selected by the user.');
+    setDiag('no port selected');
+  } else if (err.name === 'SecurityError') {
+    appendLog('Page must be served over HTTPS or http://localhost to use Web Serial.');
+    setDiag('insecure context');
+  } else {
+    appendLog('Error: ' + (err.message || err));
+    setDiag('error: ' + (err.message || err.name || err));
+  }
+}
+
+async function disconnect() {
+  keepReading = false;
+  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
+  try { if (reader) { await reader.cancel(); reader.releaseLock(); reader = null; } } catch(e){}
+  try { if (writer) { await writer.close(); writer.releaseLock(); writer = null; } } catch(e){}
+  try { if (port) { await port.close(); port = null; } } catch(e){}
+  appendLog('Port closed.');
+  setDiag('disconnected');
+  btnChoose.disabled = false;
+  btnUseGranted.disabled = false;
+  btnDisconnect.disabled = true;
+  btnSend.disabled = true;
+  btnAutoPoll.disabled = true;
+  btnStopAuto.disabled = true;
+}
+
+async function readLoop() {
+  const delimiter = getDelimiter();
+  let buffer = '';
+  try {
+    while (keepReading && reader) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        buffer += value;
+        const parts = buffer.split(delimiter);
+        buffer = parts.pop(); // last partial
+        for (const p of parts) {
+          const line = p.trim();
+          if (!line) continue;
+          appendLog('RAW: ' + line);
+          handleFrame(line);
+        }
+      }
+    }
+  } catch (err) {
+    appendLog('Read error: ' + (err.message || err));
+    setDiag('read error');
+  }
+}
+
+function handleFrame(line) {
+  const cleaned = line.replace(/[\x00-\x1F\x7F]/g, '').trim();
+  const m = cleaned.match(weightRegex);
+  if (m) {
+    const value = parseFloat(m[1]);
+    const unit = (m[2] || '').toLowerCase();
+    valEl.textContent = value;
+    unitEl.textContent = unit || 'unknown';
+    statusEl.textContent = 'OK';
+  } else {
+    if (/stable/i.test(cleaned)) statusEl.textContent = 'STABLE';
+    else if (/unstable|motion/i.test(cleaned)) statusEl.textContent = 'UNSTABLE';
+    else if (/ol|overload/i.test(cleaned)) statusEl.textContent = 'OVERLOAD';
+    else statusEl.textContent = 'UNPARSED';
+  }
+}
+
+async function sendRequestOnce() {
+  if (!writer) { appendLog('Not connected'); setDiag('not connected'); return; }
+  const raw = document.getElementById('requestCmd').value || '';
+  const payload = decodeEscapes(raw);
+  try {
+    await writer.write(payload);
+    appendLog('Sent: ' + raw.replace(/\r/g,'\\r').replace(/\n/g,'\\n'));
+  } catch (err) {
+    appendLog('Write error: ' + (err.message || err));
+    setDiag('write error');
+  }
+}
+
+function startAutoPoll() {
+  if (pollInterval) return;
+  pollInterval = setInterval(sendRequestOnce, 1000);
+  btnAutoPoll.disabled = true;
+  btnStopAuto.disabled = false;
+  appendLog('Auto poll started (1s).');
+  setDiag('auto polling');
+}
+
+function stopAutoPoll() {
+  if (!pollInterval) return;
+  clearInterval(pollInterval);
+  pollInterval = null;
+  btnAutoPoll.disabled = false;
+  btnStopAuto.disabled = true;
+  appendLog('Auto poll stopped.');
+  setDiag('connected');
+}
+
+async function listOSPorts() {
+  // This lists ports previously granted to the origin only.
+  // It cannot enumerate all OS ports unless the user has granted access.
+  if (!('serial' in navigator)) {
+    appendLog('Web Serial API not supported.');
+    return;
+  }
+  try {
+    const ports = await navigator.serial.getPorts();
+    appendLog('Previously granted ports count: ' + ports.length);
+    ports.forEach((p, i) => {
+      try {
+        appendLog(`  granted[${i}] info: ${JSON.stringify(p.getInfo ? p.getInfo() : p)}`);
+      } catch (e) {
+        appendLog(`  granted[${i}] (no getInfo)`);
+      }
+    });
+    // Also show a hint to check OS Device Manager
+    appendLog('If no ports appear here, check OS Device Manager and drivers.');
+  } catch (err) {
+    appendLog('getPorts error: ' + (err.message || err));
+  }
+}
+
+// Event listeners
+btnChoose.addEventListener('click', connectWithPicker);
+btnUseGranted.addEventListener('click', usePreviouslyGranted);
+btnDisconnect.addEventListener('click', disconnect);
+btnSend.addEventListener('click', sendRequestOnce);
+btnAutoPoll.addEventListener('click', startAutoPoll);
+btnStopAuto.addEventListener('click', stopAutoPoll);
+btnListPorts.addEventListener('click', listOSPorts);
+btnClearLog.addEventListener('click', () => rawLog.textContent = '');
+
+// On load, show previously granted ports count
+(async function init() {
+  if (!('serial' in navigator)) {
+    appendLog('Web Serial API not supported in this browser.');
+    setDiag('Web Serial not supported');
+    btnChoose.disabled = true;
+    btnUseGranted.disabled = true;
+    btnListPorts.disabled = true;
+    return;
+  }
+  try {
+    const ports = await navigator.serial.getPorts();
+    appendLog(`Previously granted ports: ${ports.length}`);
+    if (ports.length > 0) btnUseGranted.disabled = false;
+  } catch (err) {
+    appendLog('getPorts error: ' + (err.message || err));
+  }
+})();
+</script>
+</body>
+</html>
