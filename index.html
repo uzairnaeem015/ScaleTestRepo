@@ -101,6 +101,12 @@ let writer = null;
 let keepReading = false;
 let pollInterval = null;
 
+let readablePipe = null;
+let writablePipe = null;
+let readableAbortController = null;
+let writableAbortController = null;
+
+
 // Adjust this regex to match your scale's ASCII output exactly
 const weightRegex = /([+-]?\d{1,7}(?:\.\d+)?)[\s]*([kKgGlLbB]{1,2})?/;
 
@@ -135,15 +141,23 @@ async function setupPort(chosenPort) {
   appendLog(`Port opened: ${baudRate} ${dataBits}/${parity}/${stopBits}`);
   setDiag('connected');
 
-  // Writer: TextEncoderStream -> port.writable
-  const textEncoder = new TextEncoderStream();
-  textEncoder.readable.pipeTo(chosenPort.writable);
-  writer = textEncoder.writable.getWriter();
+  // Writer
+  const encoder = new TextEncoderStream();
+  writableAbortController = new AbortController();
+  writablePipe = encoder.readable.pipeTo(
+    chosenPort.writable,
+    { signal: writableAbortController.signal }
+  );
+  writer = encoder.writable.getWriter();
 
-  // Reader: port.readable -> TextDecoderStream
-  const textDecoder = new TextDecoderStream();
-  chosenPort.readable.pipeTo(textDecoder.writable);
-  reader = textDecoder.readable.getReader();
+  // Reader
+  const decoder = new TextDecoderStream();
+  readableAbortController = new AbortController();
+  readablePipe = chosenPort.readable.pipeTo(
+    decoder.writable,
+    { signal: readableAbortController.signal }
+  );
+  reader = decoder.readable.getReader();
 
   port = chosenPort;
   keepReading = true;
@@ -156,6 +170,7 @@ async function setupPort(chosenPort) {
   btnAutoPoll.disabled = false;
   btnStopAuto.disabled = true;
 }
+
 
 async function connectWithPicker() {
   if (!('serial' in navigator)) {
@@ -203,13 +218,58 @@ function handleSerialError(err) {
 }
 
 async function disconnect() {
+  setDiag('disconnecting...');
   keepReading = false;
-  if (pollInterval) { clearInterval(pollInterval); pollInterval = null; }
-  try { if (reader) { await reader.cancel(); reader.releaseLock(); reader = null; } } catch(e){}
-  try { if (writer) { await writer.close(); writer.releaseLock(); writer = null; } } catch(e){}
-  try { if (port) { await port.close(); port = null; } } catch(e){}
+
+  if (pollInterval) {
+    clearInterval(pollInterval);
+    pollInterval = null;
+  }
+
+  // 1. Stop reader
+  try {
+    if (reader) {
+      await reader.cancel();
+      reader.releaseLock();
+      reader = null;
+    }
+  } catch {}
+
+  // 2. Abort pipes
+  try { readableAbortController?.abort(); } catch {}
+  try { writableAbortController?.abort(); } catch {}
+
+  // 3. Wait for pipeTo() to settle (THIS IS THE KEY)
+  try { await readablePipe; } catch {}
+  try { await writablePipe; } catch {}
+
+  readablePipe = null;
+  writablePipe = null;
+  readableAbortController = null;
+  writableAbortController = null;
+
+  // 4. Close writer
+  try {
+    if (writer) {
+      await writer.close();
+      writer.releaseLock();
+      writer = null;
+    }
+  } catch {}
+
+  // 5. NOW the port can close
+  try {
+    if (port) {
+      await port.close();
+      port = null;
+    }
+  } catch (e) {
+    appendLog('Port close error: ' + e.message);
+  }
+
   appendLog('Port closed.');
   setDiag('disconnected');
+
   btnChoose.disabled = false;
   btnUseGranted.disabled = false;
   btnDisconnect.disabled = true;
@@ -217,6 +277,7 @@ async function disconnect() {
   btnAutoPoll.disabled = true;
   btnStopAuto.disabled = true;
 }
+
 
 async function readLoop() {
   const delimiter = getDelimiter();
@@ -347,4 +408,3 @@ btnClearLog.addEventListener('click', () => rawLog.textContent = '');
 </script>
 </body>
 </html>
-
